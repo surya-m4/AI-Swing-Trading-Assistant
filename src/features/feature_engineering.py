@@ -1,0 +1,142 @@
+"""
+Main feature engineering pipeline module for the Swing Trading Assistant.
+"""
+
+import logging
+import numpy as np
+import pandas as pd
+
+from src.features.indicators import TechnicalIndicators
+from src.features.candlestick import CandlestickFeatures
+
+# Configure logger
+logger = logging.getLogger(__name__)
+
+
+class FeatureEngineeringPipeline:
+    """Pipeline for engineering features from cleaned OHLCV data."""
+
+    def __init__(self):
+        """Initialize the feature engineering pipeline with sub-components."""
+        self.indicators = TechnicalIndicators()
+        self.candlestick = CandlestickFeatures()
+
+    def _validate_data(self, df: pd.DataFrame) -> None:
+        """Verify the DataFrame contains all required base columns.
+
+        Args:
+            df (pd.DataFrame): Input DataFrame.
+
+        Raises:
+            ValueError: If required columns are missing.
+        """
+        required_columns = ["Date", "Open", "High", "Low", "Close", "Volume"]
+        missing = [col for col in required_columns if col not in df.columns]
+        if missing:
+            error_msg = f"Missing required base columns for feature engineering: {missing}"
+            logger.error(error_msg)
+            raise ValueError(error_msg)
+
+    def _create_lag_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Create lag features for Close price and Volume.
+
+        Args:
+            df (pd.DataFrame): Input DataFrame.
+
+        Returns:
+            pd.DataFrame: DataFrame with lag features added.
+        """
+        df["Close_Lag_1"] = df["Close"].shift(1)
+        df["Close_Lag_2"] = df["Close"].shift(2)
+        df["Close_Lag_3"] = df["Close"].shift(3)
+        df["Volume_Lag_1"] = df["Volume"].shift(1)
+        return df
+
+    def _create_general_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Generate general statistical and price-action features.
+
+        Features include: Daily Return, Log Return, Percentage Change,
+        Rolling Mean, Rolling Standard Deviation, Volatility, Momentum, and ROC.
+
+        Args:
+            df (pd.DataFrame): Input DataFrame.
+
+        Returns:
+            pd.DataFrame: DataFrame with general features added.
+        """
+        # Returns and Changes
+        df["Daily_Return"] = df["Close"].diff()
+        # Suppress divide by zero/log(0) warnings by handling gracefully if needed, 
+        # though normally prices shouldn't be 0 or negative
+        df["Log_Return"] = np.log(df["Close"] / df["Close"].shift(1))
+        df["Percentage_Change"] = df["Close"].pct_change()
+        
+        # Rolling Statistics (14-day window as a common default)
+        df["Rolling_Mean"] = df["Close"].rolling(window=14).mean()
+        df["Rolling_Standard_Deviation"] = df["Close"].rolling(window=14).std()
+        
+        # Volatility (Rolling standard deviation of log returns)
+        df["Volatility"] = df["Log_Return"].rolling(window=14).std()
+        
+        # Momentum (Difference between current close and close N periods ago)
+        df["Momentum"] = df["Close"] - df["Close"].shift(10)
+        
+        # Rate of Change (ROC) - Percentage change over N periods
+        df["Rate_of_Change"] = df["Close"].pct_change(periods=10)
+        
+        return df
+
+    def run(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Execute the complete feature engineering pipeline.
+
+        This method validates the data, applies technical indicators, generates
+        candlestick features, adds general/statistical features, creates lags,
+        and handles NaN values resulting from rolling calculations.
+
+        Args:
+            df (pd.DataFrame): Cleaned OHLCV DataFrame.
+
+        Returns:
+            pd.DataFrame: Engineered DataFrame ready for modeling.
+        """
+        logger.info("Feature generation started.")
+        
+        if df.empty:
+            logger.warning("Empty DataFrame provided to feature engineering pipeline.")
+            return df
+
+        # Work on a copy to avoid mutating the original dataframe unexpectedly
+        df = df.copy()
+        
+        self._validate_data(df)
+
+        # 1. Technical Indicators
+        df = self.indicators.add_sma(df)
+        df = self.indicators.add_ema(df)
+        df = self.indicators.add_rsi(df)
+        df = self.indicators.add_macd(df)
+        df = self.indicators.add_bollinger_bands(df)
+        df = self.indicators.add_atr(df)
+        df = self.indicators.add_adx(df)
+        df = self.indicators.add_stochastic_oscillator(df)
+        df = self.indicators.add_cci(df)
+        df = self.indicators.add_obv(df)
+        logger.info("Technical indicators created.")
+
+        # 2. Candlestick Features
+        df = self.candlestick.generate_features(df)
+        logger.info("Candlestick features created.")
+
+        # 3. General Features
+        df = self._create_general_features(df)
+
+        # 4. Lag Features
+        df = self._create_lag_features(df)
+        logger.info("Lag features created.")
+
+        # Remove NaN values generated by rolling/shift calculations
+        df = df.dropna().reset_index(drop=True)
+        
+        logger.info("Feature engineering completed successfully.")
+        
+        return df
