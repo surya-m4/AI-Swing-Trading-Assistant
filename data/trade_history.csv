@@ -1,0 +1,2 @@
+Trade ID,Ticker,Action,Price,Quantity,Timestamp,Broker,Status,PnL
+TRD_FBEC0201,INFY.NS,BUY,1400.0,10.0,2026-07-22T08:15:32.000421Z,Paper,EXECUTED,0.0

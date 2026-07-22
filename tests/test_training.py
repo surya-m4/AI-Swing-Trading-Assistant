@@ -1,141 +1,136 @@
 import os
-import tempfile
 import pytest
 import pandas as pd
 import numpy as np
+from unittest.mock import patch, MagicMock
 
-from src.models.model_factory import ModelFactory
-from src.models.trainer import Trainer
-from src.models.save_model import ModelSaver
-from src.models.train import load_and_validate_data, prepare_data
-
-@pytest.fixture
-def dummy_data():
-    """Fixture to create a dummy dataframe for testing."""
-    np.random.seed(42)
-    data = {
-        'Feature1': np.random.rand(100),
-        'Feature2': np.random.rand(100),
-        'Target': np.random.randint(0, 2, 100)
-    }
-    return pd.DataFrame(data)
+from src.training.model_factory import ModelFactory
+from src.training.trainer import Trainer
+from src.training.train_pipeline import TrainPipeline
+from src.mlflow_tracking.experiment_tracker import ExperimentTracker
 
 @pytest.fixture
-def temp_dir():
-    """Fixture to create a temporary directory for saving models."""
-    with tempfile.TemporaryDirectory() as temp_dir:
-        yield temp_dir
+def sample_data():
+    df = pd.DataFrame({
+        'feature1': [1, 2, 3, 4, 5],
+        'feature2': [5, 4, 3, 2, 1],
+        'label': ['BUY', 'SELL', 'HOLD', 'BUY', 'SELL']
+    })
+    return df
 
-# --- Data Validation Tests ---
-
-def test_load_and_validate_data_success(dummy_data, temp_dir):
-    filepath = os.path.join(temp_dir, 'dummy.csv')
-    dummy_data.to_csv(filepath, index=False)
+@pytest.fixture
+def trainer(tmp_path):
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    models_dir = tmp_path / "models"
+    artifacts_dir = tmp_path / "artifacts"
     
-    df = load_and_validate_data(filepath, 'Target')
-    assert not df.empty
-    assert 'Target' in df.columns
+    return Trainer(data_dir=str(data_dir), models_dir=str(models_dir), artifacts_dir=str(artifacts_dir))
 
-def test_load_and_validate_data_missing_file():
-    with pytest.raises(FileNotFoundError):
-        load_and_validate_data('non_existent_file.csv', 'Target')
-
-def test_load_and_validate_data_empty_dataset(temp_dir):
-    filepath = os.path.join(temp_dir, 'empty.csv')
-    pd.DataFrame().to_csv(filepath, index=False)
+def test_model_factory_get_model():
+    # Test valid models
+    rf = ModelFactory.get_model('random_forest')
+    assert rf.__class__.__name__ == 'RandomForestClassifier'
     
-    with pytest.raises(ValueError, match="The dataset is empty."):
-        load_and_validate_data(filepath, 'Target')
-
-def test_load_and_validate_data_missing_label(dummy_data, temp_dir):
-    df_missing_label = dummy_data.drop(columns=['Target'])
-    filepath = os.path.join(temp_dir, 'missing_label.csv')
-    df_missing_label.to_csv(filepath, index=False)
+    xgb = ModelFactory.get_model('xgboost')
+    assert xgb.__class__.__name__ == 'XGBClassifier'
     
-    with pytest.raises(ValueError, match="Label column 'Target' not found"):
-        load_and_validate_data(filepath, 'Target')
-
-def test_prepare_data(dummy_data):
-    X_train, X_test, y_train, y_test = prepare_data(dummy_data, 'Target')
-    assert X_train.shape[0] == 80
-    assert X_test.shape[0] == 20
-    assert 'Target' not in X_train.columns
-    assert y_train.name == 'Target'
-
-# --- ModelFactory Tests ---
-
-def test_model_factory_valid_models():
-    lr_model = ModelFactory.get_model('logistic_regression')
-    assert lr_model is not None
+    lgb = ModelFactory.get_model('lightgbm')
+    assert lgb.__class__.__name__ == 'LGBMClassifier'
     
-    rf_model = ModelFactory.get_model('random_forest')
-    assert rf_model is not None
+    cat = ModelFactory.get_model('catboost')
+    assert cat.__class__.__name__ == 'CatBoostClassifier'
     
-    xgb_model = ModelFactory.get_model('xgboost')
-    assert xgb_model is not None
-
-def test_model_factory_invalid_model():
-    with pytest.raises(ValueError, match="Unsupported model name"):
+    # Test invalid model
+    with pytest.raises(ValueError):
         ModelFactory.get_model('invalid_model')
 
-# --- Trainer Tests ---
-
-def test_trainer_train_and_evaluate(dummy_data):
-    X_train, X_test, y_train, y_test = prepare_data(dummy_data, 'Target')
-    model = ModelFactory.get_model('logistic_regression')
+def test_trainer_load_data_success(trainer, sample_data, tmp_path):
+    # Setup mock file
+    filename = "test_data.csv"
+    filepath = tmp_path / "data" / filename
+    sample_data.to_csv(filepath, index=False)
     
-    trainer = Trainer()
-    metrics = trainer.train_and_evaluate('logistic_regression', model, X_train, y_train, X_test, y_test)
+    df = trainer.load_data(filename)
+    assert not df.empty
+    assert len(df) == 5
+    assert 'label' in df.columns
+
+def test_trainer_load_data_not_found(trainer):
+    with pytest.raises(FileNotFoundError):
+        trainer.load_data("non_existent.csv")
+
+def test_trainer_load_data_empty(trainer, tmp_path):
+    filename = "empty.csv"
+    filepath = tmp_path / "data" / filename
+    pd.DataFrame().to_csv(filepath, index=False)
+    
+    with pytest.raises(ValueError):
+        trainer.load_data(filename)
+
+def test_trainer_prepare_data(trainer, sample_data):
+    X_train, X_test, y_train, y_test = trainer.prepare_data(sample_data, target_col='label', test_size=0.4, random_state=42)
+    
+    assert len(X_train) == 3
+    assert len(X_test) == 2
+    assert len(y_train) == 3
+    assert len(y_test) == 2
+    # Ensure encoded
+    assert set(np.unique(y_train)).issubset({0, 1, 2})
+
+def test_trainer_prepare_data_no_target(trainer, sample_data):
+    df_invalid = sample_data.drop(columns=['label'])
+    with pytest.raises(ValueError):
+        trainer.prepare_data(df_invalid, target_col='label')
+
+def test_trainer_train_and_evaluate_model(trainer, sample_data):
+    X_train, X_test, y_train, y_test = trainer.prepare_data(sample_data, target_col='label', test_size=0.4, random_state=42)
+    
+    model = ModelFactory.get_model('random_forest', params={'n_estimators': 10})
+    trained_model = trainer.train_model('random_forest', model, X_train, y_train)
+    
+    assert trained_model is not None
+    
+    # Evaluate
+    mock_tracker = MagicMock()
+    metrics = trainer.evaluate_model('random_forest', trained_model, X_test, y_test, tracker=mock_tracker)
     
     assert 'accuracy' in metrics
+    assert 'precision' in metrics
+    assert 'recall' in metrics
     assert 'f1_score' in metrics
-    assert trainer.results['logistic_regression']['metrics'] == metrics
+    
+    mock_tracker.log_metrics.assert_called_once()
+    assert mock_tracker.log_artifact.call_count == 2 # cm_path and report_path
 
-def test_trainer_get_best_model(dummy_data):
-    X_train, X_test, y_train, y_test = prepare_data(dummy_data, 'Target')
-    trainer = Trainer()
+def test_trainer_save_model(trainer):
+    model = ModelFactory.get_model('random_forest', params={'n_estimators': 10})
+    model_path = trainer.save_model(model, 'random_forest')
     
-    # Train dummy models with deterministic outcomes if possible or just use real
-    model1 = ModelFactory.get_model('logistic_regression')
-    model2 = ModelFactory.get_model('random_forest')
-    
-    trainer.train_and_evaluate('lr', model1, X_train, y_train, X_test, y_test)
-    trainer.train_and_evaluate('rf', model2, X_train, y_train, X_test, y_test)
-    
-    best_name, best_model, best_metrics = trainer.get_best_model(metric='f1_score')
-    
-    assert best_name in ['lr', 'rf']
-    assert best_metrics is not None
+    assert os.path.exists(model_path)
+    assert os.path.exists(os.path.join(trainer.models_dir, "label_encoder.pkl"))
 
-def test_trainer_get_best_model_empty():
-    trainer = Trainer()
-    with pytest.raises(ValueError, match="No models have been trained yet."):
-        trainer.get_best_model()
-
-# --- ModelSaver Tests ---
-
-def test_save_model(dummy_data, temp_dir):
-    X_train, _, y_train, _ = prepare_data(dummy_data, 'Target')
-    model = ModelFactory.get_model('logistic_regression')
-    model.fit(X_train, y_train)
+@patch('src.training.train_pipeline.Trainer')
+@patch('src.training.train_pipeline.ExperimentTracker')
+def test_train_pipeline_run(mock_tracker_class, mock_trainer_class, tmp_path):
+    mock_trainer = mock_trainer_class.return_value
+    mock_tracker = mock_tracker_class.return_value.__enter__.return_value
     
-    saver = ModelSaver(output_dir=temp_dir)
-    filepath = saver.save_model(model, 'test_model.pkl')
+    # Setup mock returns
+    mock_df = pd.DataFrame({'f1': [1,2], 'label': [0,1]})
+    mock_trainer.load_data.return_value = mock_df
+    mock_trainer.prepare_data.return_value = (pd.DataFrame(), pd.DataFrame(), np.array([]), np.array([]))
+    mock_trainer.train_model.return_value = MagicMock()
+    mock_trainer.evaluate_model.return_value = {'accuracy': 0.9}
+    mock_trainer.save_model.return_value = "path/to/model"
+    mock_trainer.artifacts_dir = str(tmp_path)
     
-    assert os.path.exists(filepath)
-
-def test_save_metrics(temp_dir):
-    saver = ModelSaver(output_dir=temp_dir)
-    metrics = {'accuracy': 0.9, 'f1_score': 0.85}
-    filepath = saver.save_metrics(metrics, 'test_metrics.json')
+    pipeline = TrainPipeline(data_filename="dummy.csv", models_to_train=['random_forest'])
+    results = pipeline.run()
     
-    assert os.path.exists(filepath)
-
-def test_save_classification_report(temp_dir):
-    saver = ModelSaver(output_dir=temp_dir)
-    report = "Dummy Classification Report"
-    filepath = saver.save_classification_report(report, 'test_report.txt')
+    assert 'random_forest' in results
+    assert results['random_forest']['accuracy'] == 0.9
     
-    assert os.path.exists(filepath)
-    with open(filepath, 'r') as f:
-        assert f.read() == report
+    mock_trainer.load_data.assert_called_once_with("dummy.csv")
+    mock_trainer.train_model.assert_called_once()
+    mock_trainer.evaluate_model.assert_called_once()
